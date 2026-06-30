@@ -11,6 +11,23 @@ Warren is a unified platform that combines four independent network technologies
 
 ---
 
+## Vision: Decentralizing the Internet
+
+**Problem:** Today's internet is controlled by 3–5 ISPs per country. They log, throttle, and comply with government censorship demands.
+
+**Solution:** Warren distributes internet infrastructure to individuals. You own bandwidth. You own privacy. You own your data.
+
+| Problem | Warren Solution |
+|---------|-----------------|
+| ISP monopoly → bandwidth shortage | Marketplace: Anyone sells spare capacity |
+| VPN bans (China, Russia, Iran) | Privacy Gateway: Transparent intent + encrypted data |
+| Censorship tracking | Independence Logger: Cryptographic proof on-chain |
+| Infrastructure collapse | Satellite Fallback: Auto-mesh when internet fails |
+
+**Market Opportunity:** $80B+ by 2030 (ISP market + privacy subscriptions + NGO analytics + satellite/mesh resilience)
+
+---
+
 ## Quick Start
 
 ### For Users

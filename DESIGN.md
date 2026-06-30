@@ -37,6 +37,7 @@ IP Layer (Actual internet routing)
 | **NAT Traversal** | STUN + ICE + UPnP fallback |
 | **Incentive** | Tokens (ERC-20 on Ethereum, or native Solana) |
 | **Consensus** | Blockchain (Ethereum or Solana) for market settlement |
+| **Micro-payments** | **Off-chain Payment Channels for per-packet/per-GB transactions** (eliminate gas fee overhead) |
 
 ### Node Types
 
@@ -124,6 +125,19 @@ contract WarrenISPMarketplace {
 }
 ```
 
+#### Settlement Model: Hybrid On-Chain + Off-Chain
+
+**Problem:** Every settlement on-chain = gas fees can exceed transaction value.
+
+**Solution:** **Off-chain Payment Channels** (similar to Lightning Network):
+
+```
+1. Buyer deposits tokens to smart contract (locks collateral)
+2. Buyer ↔ Seller exchange SIGNED receipts off-chain (no gas)
+3. Every N hours or when dispute occurs: final settlement posted on-chain
+4. Result: 1000x reduction in blockchain overhead
+```
+
 #### Data Structures
 
 ```protobuf
@@ -135,6 +149,7 @@ message MarketplaceNode {
   repeated Rating ratings;
   uint64 reputation_score;
   repeated Transaction transactions;
+  string payment_channel_address;  // Off-chain channel identifier
 }
 
 message Transaction {
@@ -197,7 +212,7 @@ func (n *MarketplaceNode) HandleBandwidthPurchase(
 
 #### Design Philosophy
 
-**Goal:** Governments can inspect *intent* (what user is doing), but cannot inspect *data* (specific content).
+**Goal:** Governments can inspect *intent* (what user is doing), but cannot inspect *data* (specific content). **Protocols themselves must be stealthy.**
 
 ```
 Without Privacy Gateway (traditional VPN):
@@ -205,9 +220,20 @@ Without Privacy Gateway (traditional VPN):
   Result: Government can't see anything → bans it
 
 With Privacy Gateway (Warren):
-  [User] → [Policy header: "NEWS"] [Content: encrypted] → [DPN Server]
-  Result: Government sees "user reading news" (legal) + doesn't see which articles (private)
+  [User] → [HTTPS/TLS Disguise Layer] → [Policy: "news"] [Content: encrypted] → [DPN Server]
+  Result: Government sees "normal HTTPS web traffic" + doesn't see Warren metadata
 ```
+
+#### Traffic Obfuscation Layer (Critical for Censorship Evasion)
+
+**Problem:** If Warren packets have recognizable headers/signatures, government DPI systems will blacklist them immediately (by IP/ASN blocking).
+
+**Solution:** **All Warren control plane traffic is obfuscated as standard HTTPS/TLS traffic** (using Pluggable Transports like Tor's obfs4 or Shadowsocks techniques):
+
+- Warren metadata (policy categories, encryption keys, node addresses) is encrypted and wrapped inside TLS handshake mimicry
+- To passive observers (governments, ISPs), Warren is indistinguishable from normal HTTPS browsing
+- Only endpoints (Warren nodes) can decrypt and interpret the policy metadata
+- Active probing (government attempting to connect as a client) fails because no real HTTPS server responds
 
 #### Policy Engine
 
@@ -326,29 +352,46 @@ Proof Structure:
   proof = zkp_prove(commitment, witness)
 ```
 
-#### Blockchain Recording
+#### Blockchain Recording with Anonymity Protection
+
+**Problem:** If user wallet address (`msg.sender`) is revealed on-chain, wallet tracking can de-anonymize the user.
+
+**Solution:** **Relayer-Assisted Anonymous Proof Submission**:
+
+- User generates ZKP locally (never broadcasts wallet address)
+- User submits proof to Warren's **anonymous Relayer nodes** (multi-hop, encrypted)
+- Relayer (trusted Warren infrastructure node) pays gas fee from relayer's own wallet
+- On-chain transaction shows: Relayer address → Proof Hash (user wallet is never on-chain)
+- Relayer is periodically rotated and collateral-bonded to prevent collusion
 
 ```solidity
 contract WarrenIndependenceLogger {
+  // Relayers are bonded, rotating addresses (prevents tracking)
+  mapping(address => uint256) public relayerBond;
+  address[] public activeRelayers;
+  
   event CensorshipEvaded(
     bytes32 indexed proofHash,
     string region,
     int64 timestamp,
-    bytes zkProof
+    bytes zkProof,
+    address relayerAddress  // NOT user wallet
   );
   
-  function logEvasion(
+  function logEvasionViaRelayer(
     bytes32 proofHash,
     string region,
-    bytes calldata zkProof
+    bytes calldata zkProof,
+    bytes calldata relayerSignature  // Proves relayer submitted this
   ) external {
+    require(verifyRelayerSignature(relayerSignature), "Invalid relayer signature");
     require(verifySingleProof(zkProof, proofHash), "Invalid proof");
-    emit CensorshipEvaded(proofHash, region, block.timestamp, zkProof);
+    emit CensorshipEvaded(proofHash, region, block.timestamp, zkProof, msg.sender);
   }
   
   function getRegionStats(string region, uint64 timeframe) 
     public view returns (uint256 evasionCount) {
-    // Query events filtered by region and timeframe
+    // Query events filtered by region and timeframe (no wallet linking)
   }
 }
 ```
@@ -423,7 +466,11 @@ func (logger *IndependenceLogger) GetRegionStats(
 
 ### Module 4: Satellite Fallback
 
-#### Failover Logic
+#### Failover Logic with Traffic Tiering
+
+**Problem:** LoRa mesh operates at kilobit/s speeds. Routing VDI (screen streaming, MB/s) or Thump workloads (GB-scale migration) through LoRa causes network collapse.
+
+**Solution:** **Strict Traffic Tiering** — LoRa restricted to Control Plane only:
 
 ```
 Primary Connection Health Monitor:
@@ -434,10 +481,30 @@ Primary Connection Health Monitor:
 
 Failover Trigger:
   IF health < 60% OR latency > 500ms THEN
-    → Route through satellite/LoRa mesh
-    → Notify Thump (workload may need relocation)
-    → Update blockchain (for reputation)
+    
+    IF still_have_satellite_uplink (Starlink/Kuiper):
+      → Route through satellite (maintains data plane)
+      → Continue VDI, Thump workloads normally
+    
+    ELSE IF LoRa_mesh_available:
+      → STOP all data plane traffic (VDI, workload migration)
+      → LoRa carries ONLY control plane:
+         • Thump heartbeat signals (alive/dead status)
+         • Emergency control commands (pause, resume, checkpoint)
+         • Warren mesh announcements (DHT updates)
+      → Hold workload migration requests until ground network recovers
+      → Notify user: "Network resilience mode (control only)"
+      
+    ELSE:
+      → Total network loss
+      → Local cache serving only (Crovi cached desktop images, etc.)
 ```
+
+**Bandwidth Guarantee:**
+- LoRa throughput: ~50 bps - 50 kbps (depending on range)
+- Control plane packets: ~100 bytes/message
+- Capacity: ~500 control messages/second (sustainable heartbeat)
+- Data plane: Explicitly disabled with DROP rule
 
 #### Node Implementation
 
@@ -474,21 +541,45 @@ func (sn *SatelliteNode) MonitorPrimaryHealth(ctx context.Context) {
 func (sn *SatelliteNode) ActivateFailover(ctx context.Context) error {
   // Try Starlink first (lower latency)
   if sn.tryStarlink(ctx) == nil {
+    sn.trafficMode = "FULL_DATA_PLANE"  // All traffic allowed
     return nil
   }
   
   // Fallback to Kuiper
   if sn.tryKuiper(ctx) == nil {
+    sn.trafficMode = "FULL_DATA_PLANE"  // All traffic allowed
     return nil
   }
   
-  // Last resort: LoRa mesh
+  // Last resort: LoRa mesh (CONTROL PLANE ONLY)
   if sn.tryLoRaMesh(ctx) == nil {
+    sn.trafficMode = "CONTROL_PLANE_ONLY"  // DROP data plane traffic
+    sn.dropDataPlaneTraffic()             // Pause VDI, workload migration
+    sn.enableControlHeartbeat()           // Enable heartbeat + control commands
+    sn.notifyThump("resilience_mode_activated")  // Notify Thump
     return nil
   }
   
   // All failed
+  sn.trafficMode = "LOCAL_CACHE_ONLY"  // Serve from local cache only
   return errors.New("all failover routes exhausted")
+}
+
+func (sn *SatelliteNode) dropDataPlaneTraffic() {
+  // Explicitly drop VDI streams, workload data
+  sn.policyEngine.SetRule("VDI_*", "DROP")
+  sn.policyEngine.SetRule("THUMP_WORKLOAD_MIGRATION", "DROP")
+  log.Info("Data plane traffic blocked: LoRa control-plane-only mode")
+}
+
+func (sn *SatelliteNode) enableControlHeartbeat() {
+  // Small, frequent heartbeat packets (~100 bytes every 5 seconds)
+  go func() {
+    ticker := time.NewTicker(5 * time.Second)
+    for range ticker.C {
+      sn.sendHeartbeatViaLoRa()  // Proves node is alive
+    }
+  }()
 }
 
 func (sn *SatelliteNode) tryStarlink(ctx context.Context) error {
@@ -618,11 +709,14 @@ ELSE
 | Threat | Attacker | Mitigation |
 |--------|----------|-----------|
 | **Network eavesdropping** | ISP, government | End-to-end encryption (ChaCha20-Poly1305) |
-| **Metadata leakage** | Passive observer | Privacy-first routing (policy headers only) |
+| **Metadata leakage** | Passive observer | Privacy-first routing + Traffic Obfuscation (masquerade as HTTPS) |
+| **DPI protocol detection** | Government (Active probing) | Traffic Obfuscation layer — Warren disguised as standard TLS/HTTPS |
 | **Traffic analysis** | Sophisticated adversary | Constant-rate padding, mixing |
-| **Node compromise** | Malicious ISP marketplace seller | Reputation system, collateral deposits |
+| **Wallet address tracking** | Blockchain analyst | Relayer-assisted anonymous proof submission (user wallet never on-chain) |
+| **Node compromise** | Malicious ISP marketplace seller | Reputation system, collateral deposits, Off-chain payment channels |
 | **Blockchain attack** | 51% attacker | Use Ethereum/Solana (high security assumption) |
 | **Denial of Service** | Network-level attacker | Rate limiting per node, Proof-of-Work on queries |
+| **LoRa mesh overload** | Attacker flooding mesh | Control-plane-only traffic restriction on LoRa (data plane explicitly dropped) |
 
 ### Encryption Standards
 
@@ -634,9 +728,19 @@ ELSE
 ### Privacy Guarantees
 
 1. **Data Privacy:** No node (not even Warren core developers) can read user data
-2. **Metadata Privacy:** Warren Privacy Gateway ensures ISP sees only policy intent
-3. **Financial Privacy:** Blockchain transactions are pseudonymous (address-based, not name-based)
-4. **Location Privacy:** LoRa + satellite failover obfuscate geographic location
+2. **Metadata Privacy:** 
+   - Warren Privacy Gateway ensures ISP sees only policy intent
+   - Traffic Obfuscation layer masks Warren protocols as standard HTTPS/TLS (defeats DPI detection)
+3. **Financial Privacy:** 
+   - Blockchain transactions are pseudonymous (address-based, not name-based)
+   - Off-chain Payment Channels eliminate on-chain gas fee overhead (no public ledger of micro-transactions)
+4. **Anonymity in Proof Submission:** 
+   - Relayer-assisted anonymous proof logging prevents wallet-address tracking
+   - User wallet address is never published on blockchain
+5. **Resilience Privacy:** 
+   - LoRa mesh restricted to control-plane-only (no data exfiltration risk)
+   - Location privacy maintained even during failover scenarios
+6. **Location Privacy:** LoRa + satellite failover obfuscate geographic location
 
 ---
 

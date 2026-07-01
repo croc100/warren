@@ -1,13 +1,22 @@
 # Warren Technical Architecture & Design
 
+> **Revision note (this update):** Reframes the censorship-evasion strategy around
+> **node-scale diversity** (the ISP Marketplace's pool of ordinary residential nodes)
+> as the primary anti-blocklisting defense, replaces naive SNI-spoofing with a
+> REALITY-style TLS borrowing scheme for Module 2, and splits Module 3 into a
+> local-only authentication proof (no on-chain trace) and a separate opt-in
+> aggregate logging path (kept to preserve the Independence Logger revenue model).
+> Rationale for each change is documented inline.
+
 ## Table of Contents
 
 1. [Core Protocol](#core-protocol)
-2. [Module Specifications](#module-specifications)
-3. [Integration Layer](#integration-layer)
-4. [Data Flow](#data-flow)
-5. [Security Model](#security-model)
-6. [Implementation Roadmap](#implementation-roadmap)
+2. [Anti-Blocklisting Defense Model](#anti-blocklisting-defense-model)
+3. [Module Specifications](#module-specifications)
+4. [Integration Layer](#integration-layer)
+5. [Data Flow](#data-flow)
+6. [Security Model](#security-model)
+7. [Implementation Roadmap](#implementation-roadmap)
 
 ---
 
@@ -37,7 +46,9 @@ IP Layer (Actual internet routing)
 | **NAT Traversal** | STUN + ICE + UPnP fallback |
 | **Incentive** | Tokens (ERC-20 on Ethereum, or native Solana) |
 | **Consensus** | Blockchain (Ethereum or Solana) for market settlement |
-| **Micro-payments** | **Off-chain Payment Channels for per-packet/per-GB transactions** (eliminate gas fee overhead) |
+| **Micro-payments** | **Off-chain Payment Channels**, settled on a hybrid trigger: every 10MB transferred **or** every 5 seconds elapsed, whichever comes first (eliminates gas fee overhead without under-specifying the settlement cadence) |
+| **Protocol Camouflage** | REALITY-style TLS session borrowing (see [Module 2](#module-2-privacy-gateway-dpn)) — replaces naive SNI spoofing |
+| **Node Discovery** | Multi-channel bootstrap (DHT + out-of-band bridge distribution) — no single broker that can become the first block target |
 
 ### Node Types
 
@@ -50,21 +61,75 @@ IP Layer (Actual internet routing)
    - Advertising node + routing
    - Tracks bandwidth utilization
    - Publishes pricing
+   - **Doubles as a camouflage relay** — ordinary residential IP, short-lived, part of the anti-blocklisting node pool (see next section)
 
 3. **Privacy Node** (runs policy engine)
    - Encryption/decryption
    - Policy decision-making
    - Never stores plaintext user data
+   - Performs REALITY handshake borrowing on behalf of connecting clients
 
 4. **Logger Node** (records independence proofs)
-   - ZKP verification
-   - Blockchain interaction
+   - ZKP verification (both local-passport and aggregate-evasion proofs)
+   - Blockchain interaction (aggregate proofs only — see [Module 3](#module-3-independence-verification--logger))
    - Analytics aggregation
 
 5. **Satellite Node** (failover gateway)
    - Starlink/Kuiper uplink
    - LoRa mesh coordinator
    - Automatic routing failover
+
+---
+
+## Anti-Blocklisting Defense Model
+
+### Why protocol camouflage alone is not enough
+
+State-level censors (China's GFW and similar systems) do not primarily rely on decoding
+protocols — they block by **IP/ASN reputation** and by **active probing** (connecting back
+to a suspected server to check whether it behaves like the site it claims to be). This is
+documented history: domain fronting (relying on a CDN's SNI/Host mismatch) is dead because
+major CDNs (Google, Cloudflare, AWS) disabled it; commercial VPN providers are blocked within
+days of launch because their exit servers sit on a small, enumerable set of datacenter IP
+ranges, regardless of how well the tunnel protocol is disguised.
+
+**Consequence for Warren:** protocol-level disguise (Module 2) is necessary but not
+sufficient. The durable defense is **making the set of endpoints too large, too ordinary,
+and too short-lived to blocklist** — which is exactly what the ISP Marketplace's model of
+ordinary residential nodes selling spare bandwidth already provides, if the routing and
+discovery layers are designed to exploit it.
+
+### The two-layer model
+
+```
+Layer 1 (structural):  ISP Marketplace node pool
+                        → thousands of ordinary residential IPs, constantly
+                          rotating as sellers join/leave the market
+                        → blocking cost for the censor scales with the number
+                          of households, not the number of "VPN companies"
+
+Layer 2 (protocol):    Privacy Gateway camouflage
+                        → each individual connection, to a passive AND active
+                          observer, looks like a real visit to a real site
+                        → defeats DPI signature matching + active probing
+```
+
+This mirrors the precedent set by Psiphon/Snowflake (structural defense via large,
+ephemeral, volunteer-run proxy pools) combined with the REALITY protocol (state-of-the-art
+protocol camouflage that survives active probing) — rather than inventing a new approach
+from scratch, Warren composes two independently-proven patterns on top of infrastructure
+(the Marketplace) it already needed for its bandwidth-trading business.
+
+### Design implication
+
+Module 1 (ISP Marketplace) is no longer just a revenue mechanism — it is reclassified as
+**primary infrastructure for censorship resistance**, with Module 2 (Privacy Gateway) as the
+per-connection camouflage layer riding on top of it. This changes one thing operationally:
+marketplace node selection for a censorship-evasion session should prefer **node diversity
+and churn** (many small residential sellers) over **node quality** (few large, stable,
+high-bandwidth sellers) — the opposite of what a pure bandwidth-marketplace optimizer would
+pick. The routing algorithm needs a `mode=resilience` weighting that trades some throughput
+for endpoint diversity.
 
 ---
 
@@ -224,16 +289,57 @@ With Privacy Gateway (Warren):
   Result: Government sees "normal HTTPS web traffic" + doesn't see Warren metadata
 ```
 
-#### Traffic Obfuscation Layer (Critical for Censorship Evasion)
+**Forward-looking risk:** full VPN bans (as opposed to VPN-protocol detection) are moving
+toward **application whitelisting** — permitting only a fixed set of domestic apps (e.g.
+WeChat-class traffic) rather than trying to detect and block every foreign protocol. If a
+region moves to this model, "looking like generic HTTPS" stops being sufficient, and the
+camouflage target needs to shift toward mimicking an explicitly whitelisted app's traffic
+pattern rather than a generic popular website. This is out of scope for the current
+implementation phase but should inform which sites are chosen as REALITY targets per region.
 
-**Problem:** If Warren packets have recognizable headers/signatures, government DPI systems will blacklist them immediately (by IP/ASN blocking).
+#### Protocol Camouflage: REALITY-Style TLS Borrowing (Critical for Censorship Evasion)
 
-**Solution:** **All Warren control plane traffic is obfuscated as standard HTTPS/TLS traffic** (using Pluggable Transports like Tor's obfs4 or Shadowsocks techniques):
+**Problem:** If Warren packets have recognizable headers/signatures, government DPI systems
+will blacklist them immediately (by IP/ASN blocking). Worse, **naive SNI spoofing does not
+work**: if a client's TLS ClientHello claims `SNI = www.google.com` while the destination IP
+is a Warren node (not a Google-owned IP/ASN), a state-level DPI system that correlates
+SNI-to-IP ownership flags this immediately. Domain fronting (routing through a real CDN edge
+that hosts the spoofed name) is the correct fix for this specific failure mode, but is
+largely closed off — major CDNs disabled cross-domain fronting after it was weaponized for
+circumvention.
 
-- Warren metadata (policy categories, encryption keys, node addresses) is encrypted and wrapped inside TLS handshake mimicry
-- To passive observers (governments, ISPs), Warren is indistinguishable from normal HTTPS browsing
-- Only endpoints (Warren nodes) can decrypt and interpret the policy metadata
-- Active probing (government attempting to connect as a client) fails because no real HTTPS server responds
+**Solution:** **REALITY-style TLS session borrowing**, not SNI spoofing:
+
+- Each Privacy Node is paired with a real, currently-popular HTTPS site it can legitimately
+  proxy a TLS handshake through (the actual target of the handshake is real — the node does
+  not fabricate a certificate or claim an identity it can't back up)
+- A Warren client's traffic is authenticated via a short cryptographic tag embedded in the
+  TLS ClientHello's otherwise-unused extension bytes, verifiable only by the target Privacy
+  Node's private key. To anyone else — including active probes — the connection is
+  indistinguishable from a real visit to the real site, because for non-Warren clients it
+  genuinely **is** a real visit (the Privacy Node relays to the real site by default,
+  identical to how xray-core's REALITY protocol operates)
+- **Active probing resistance:** if a censor's probe connects and does not present the
+  correct authentication tag, the Privacy Node transparently proxies to the real site with a
+  real, valid certificate chain — the probe sees a legitimate site and has nothing to flag
+- This is a different failure mode fix than plain protocol mimicry: mimicry can be detected
+  by an adversary who tries the handshake themselves and notices the "site" doesn't behave
+  like the real one (session resumption gaps, ALPN mismatches, etc.); TLS borrowing avoids
+  this because the fallback path *is* the real site
+
+**Decentralized bootstrap / discovery:** node addresses and the site-pairing list must not be
+served from a single central endpoint — that endpoint becomes the first thing blocked. Follow
+the Tor-bridge precedent: distribute via multiple independent, low-volume out-of-band
+channels (e.g., rotating subsets shared via email autoresponders, encrypted messaging
+channels) in addition to DHT discovery, so no single choke point exists.
+
+**Traffic shape normalization:** small random padding (a few dozen bytes) is not sufficient
+against ML-based flow classifiers, which fingerprint packet-size distributions and inter-
+arrival timing rather than payload signatures — this is a well-documented weakness in
+website-fingerprinting research even against Tor. Warren instead normalizes VDI/data-plane
+traffic into a small number of fixed packet-size buckets and injects constant-rate cover
+traffic during idle periods, so the observable bandwidth profile stays flat regardless of
+underlying activity.
 
 #### Policy Engine
 
@@ -337,7 +443,53 @@ func (pg *PrivacyGateway) ProcessPacket(pkt *Packet) (*RoutedPacket, error) {
 
 ---
 
-### Module 3: Independence Logger (Proof-of-Independence)
+### Module 3: Independence Verification & Logger
+
+**Design note:** this module is split into two independent proofs with different purposes.
+An earlier draft proposed replacing all on-chain evasion logging with a purely local
+authentication proof, on the grounds that logging evasion metadata anywhere is a privacy
+mistake. That's correct for *authentication*, but conflating it with *logging* would remove
+the aggregate censorship statistics that the Independence Logger revenue line (NGO/research
+data subscriptions, $20K–100K/year per the business plan) depends on. The two are kept
+separate below so neither goal compromises the other.
+
+#### 3a. ZK-Passport: Local Handshake Authorization (no on-chain trace)
+
+Used at P2P handshake time to prove "this is a node holding a valid independence passport"
+without revealing which node, and without ever touching the blockchain. Verified peer-to-peer
+between the two handshaking nodes only.
+
+**Unlinkability requirement:** a static commitment (e.g. `hash(secret, hardware_serial)`)
+reused across sessions is itself a fingerprint — repeated presentation of the same commitment
+across different relays/times lets a correlating observer link sessions to the same device,
+defeating the purpose. Each handshake must instead present a **fresh nullifier** derived from
+the same underlying secret (Semaphore-style), so two sessions from the same device are
+provably from *a* valid passport-holder but not provably from the *same* one.
+
+```
+Circuit inputs:
+  private: passport_secret, hardware_binding
+  public:  passport_commitment (registered once, off-chain, with the issuing node)
+           session_nullifier = hash(passport_secret, session_epoch)
+
+  Proves:  commitment = hash(passport_secret, hardware_binding)   [knowledge of a valid passport]
+       AND session_nullifier correctly derived from passport_secret for this session_epoch
+       WITHOUT revealing passport_secret or hardware_binding
+
+Result exchanged over the wire: only (session_nullifier, proof) — never the commitment,
+never a wallet address, never touches the blockchain.
+```
+
+#### 3b. Aggregate Evasion Logger (on-chain, opt-in, statistics only)
+
+This is the existing Independence Logger design below, **unchanged** — it remains the
+mechanism that produces the region-level censorship statistics sold to NGOs/researchers.
+Two things distinguish it from 3a and keep it privacy-safe:
+
+- It is **opt-in** and produces only aggregate/batched counts, not per-session records
+  correlatable to a specific user's browsing
+- It uses the same relayer-assisted anonymity model already designed below, so individual
+  wallet addresses never appear on-chain even for this aggregate reporting
 
 #### Zero-Knowledge Proof (ZKP) Generation
 
@@ -709,14 +861,18 @@ ELSE
 | Threat | Attacker | Mitigation |
 |--------|----------|-----------|
 | **Network eavesdropping** | ISP, government | End-to-end encryption (ChaCha20-Poly1305) |
-| **Metadata leakage** | Passive observer | Privacy-first routing + Traffic Obfuscation (masquerade as HTTPS) |
-| **DPI protocol detection** | Government (Active probing) | Traffic Obfuscation layer — Warren disguised as standard TLS/HTTPS |
-| **Traffic analysis** | Sophisticated adversary | Constant-rate padding, mixing |
-| **Wallet address tracking** | Blockchain analyst | Relayer-assisted anonymous proof submission (user wallet never on-chain) |
+| **Metadata leakage** | Passive observer | Privacy-first routing + Protocol Camouflage (REALITY-style TLS borrowing) |
+| **SNI-to-IP correlation** | Government (Passive + list-based) | TLS borrowing routes to the *real* site's actual infrastructure, not a spoofed SNI on Warren-owned IPs |
+| **Active probing** | Government (connects back to suspected server) | Non-authenticated connections fall through to a genuine proxied response from the real site — nothing to flag |
+| **IP/ASN blocklisting of exit nodes** | Government (bulk block by network range) | Node-scale defense — ISP Marketplace's large, churning pool of residential nodes, not a small set of datacenter exits |
+| **Traffic analysis (ML flow classification)** | Sophisticated adversary | Fixed-bucket packet sizing + constant-rate cover traffic (not just random padding) |
+| **Session linkability across handshakes** | Passive/active correlator | ZK-Passport session nullifiers (Module 3a) — no static commitment reused across sessions |
+| **Wallet address tracking** | Blockchain analyst | Relayer-assisted anonymous proof submission (user wallet never on-chain); Module 3a proofs never touch chain at all |
 | **Node compromise** | Malicious ISP marketplace seller | Reputation system, collateral deposits, Off-chain payment channels |
 | **Blockchain attack** | 51% attacker | Use Ethereum/Solana (high security assumption) |
 | **Denial of Service** | Network-level attacker | Rate limiting per node, Proof-of-Work on queries |
 | **LoRa mesh overload** | Attacker flooding mesh | Control-plane-only traffic restriction on LoRa (data plane explicitly dropped) |
+| **Discovery/bootstrap takedown** | Government blocks the node-list source | Multi-channel decentralized bootstrap (DHT + out-of-band bridge distribution), no single broker |
 
 ### Encryption Standards
 
@@ -730,17 +886,23 @@ ELSE
 1. **Data Privacy:** No node (not even Warren core developers) can read user data
 2. **Metadata Privacy:** 
    - Warren Privacy Gateway ensures ISP sees only policy intent
-   - Traffic Obfuscation layer masks Warren protocols as standard HTTPS/TLS (defeats DPI detection)
+   - REALITY-style TLS borrowing masks Warren connections as real visits to real sites,
+     surviving both passive DPI signature matching and active probing
 3. **Financial Privacy:** 
    - Blockchain transactions are pseudonymous (address-based, not name-based)
    - Off-chain Payment Channels eliminate on-chain gas fee overhead (no public ledger of micro-transactions)
 4. **Anonymity in Proof Submission:** 
-   - Relayer-assisted anonymous proof logging prevents wallet-address tracking
-   - User wallet address is never published on blockchain
+   - Module 3a (ZK-Passport handshake auth) never touches the blockchain and uses
+     per-session nullifiers, so device identity cannot be linked across sessions
+   - Module 3b (aggregate evasion logging) uses relayer-assisted anonymous submission —
+     user wallet address is never published on blockchain, and only aggregate counts are logged
 5. **Resilience Privacy:** 
    - LoRa mesh restricted to control-plane-only (no data exfiltration risk)
    - Location privacy maintained even during failover scenarios
 6. **Location Privacy:** LoRa + satellite failover obfuscate geographic location
+7. **Anti-Blocklisting (structural, not just cryptographic):**
+   - Exit/relay diversity comes from the ISP Marketplace's residential node pool, not a
+     small enumerable set of infrastructure IPs — see [Anti-Blocklisting Defense Model](#anti-blocklisting-defense-model)
 
 ---
 
@@ -769,14 +931,19 @@ ELSE
 **Goals:**
 - [ ] Privacy-first routing protocol (DPN)
 - [ ] Policy engine (YAML-based user policies)
-- [ ] Independence Logger (ZKP generation)
-- [ ] Blockchain logging (Ethereum mainnet)
+- [ ] REALITY-style TLS borrowing (Module 2 protocol camouflage)
+- [ ] Decentralized bootstrap/discovery (multi-channel, no single broker)
+- [ ] ZK-Passport local handshake auth with session nullifiers (Module 3a)
+- [ ] Independence Logger aggregate ZKP generation (Module 3b)
+- [ ] Blockchain logging (Ethereum mainnet) — Module 3b only, aggregate stats
 
 **Deliverables:**
 - CLI: `warren privacy policy set`
+- Active-probing resistance test harness (isolated DPI simulator, validates against real
+  active-probe behavior, not just passive signature-matching tools like nDPI)
 - Dashboard: Real-time censorship stats
 
-**Tech Stack:** Go + Ethereum Goerli/Sepolia + libsnark
+**Tech Stack:** Go + Ethereum Goerli/Sepolia + libsnark + Circom/Groth16 (Module 3a)
 
 ---
 
